@@ -3,35 +3,23 @@ import {
   PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis,
   Tooltip, Legend, ResponsiveContainer, CartesianGrid,
 } from "recharts";
-import * as pdfjsLib from "pdfjs-dist";
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  "pdfjs-dist/build/pdf.worker.mjs",
-  import.meta.url
-).toString();
+import {
+  addStatement, getAllStatements, getAllTransactions,
+  deleteStatement, clearAll, exportData, importData,
+  updateTransactionCategories,
+  type DbStatement, type DbTransaction, type BackupPayload,
+  type StatementType,
+} from "./db";
+import { extractPdf, readTextFile, parseTxns, categorize, inferBank, fmtSize, normalizeDate } from "./parser";
 
 // ── Types ────────────────────────────────────────────────
-interface Transaction {
+interface TransactionWithMeta {
   date: string;
   description: string;
   amount: number;
   category: string;
-}
-
-interface TransactionWithMeta extends Transaction {
   bank: string;
   stmtId: string;
-}
-
-interface Statement {
-  id: string;
-  name: string;
-  bank: string;
-  date: string;
-  size: string;
-  content: string;
-  transactions: Transaction[];
-  isPdf: boolean;
 }
 
 interface PieDataItem {
@@ -43,11 +31,6 @@ interface MonthlyDataItem {
   month: string;
   income: number;
   expenses: number;
-}
-
-interface CategoryDef {
-  name: string;
-  keys: string[];
 }
 
 // ── Constants ────────────────────────────────────────────
@@ -67,207 +50,8 @@ const PIE_COLORS = [
   "#a07030","#605040","#408060","#506080",
 ];
 
-const CATEGORIES: CategoryDef[] = [
-  { name: "Housing", keys: ["rent", "mortgage", "hoa", "property tax", "home", "apartment", "lease"] },
-  { name: "Groceries", keys: ["grocery", "groceries", "whole foods", "trader joe", "kroger", "safeway", "walmart", "costco", "aldi", "publix", "food lion", "heb ", "wegmans", "sprouts"] },
-  { name: "Dining", keys: ["restaurant", "cafe", "coffee", "starbucks", "mcdonald", "uber eats", "doordash", "grubhub", "chipotle", "pizza", "sushi", "bar ", "grill", "diner", "taco", "burger", "panda express", "chick-fil-a", "wendy", "dunkin", "panera", "subway", "kfc"] },
-  { name: "Transport", keys: ["gas", "fuel", "shell", "chevron", "exxon", "uber ", "lyft", "parking", "toll", "transit", "metro", "bus", "train", "airline", "flight", "southwest", "delta air", "united air", "american air", "amtrak", "bp ", "sunoco", "speedway"] },
-  { name: "Utilities", keys: ["electric", "water bill", "gas bill", "internet", "comcast", "verizon", "at&t", "t-mobile", "phone bill", "utility", "sewage", "trash", "waste", "spectrum", "xfinity"] },
-  { name: "Healthcare", keys: ["pharmacy", "cvs", "walgreens", "doctor", "hospital", "medical", "dental", "health", "copay", "prescription", "clinic", "urgent care", "labcorp"] },
-  { name: "Shopping", keys: ["amazon", "ebay", "apple.com", "best buy", "nike", "nordstrom", "macy", "zara", "h&m", "ikea", "home depot", "lowes", "wayfair", "etsy", "target", "marshalls", "tj maxx"] },
-  { name: "Entertainment", keys: ["netflix", "spotify", "hulu", "disney+", "hbo", "youtube", "apple tv", "gaming", "steam", "playstation", "xbox", "movie", "cinema", "concert", "ticket"] },
-  { name: "Subscriptions", keys: ["subscription", "member", "premium", "annual fee", "monthly fee", "renewal", "patreon", "icloud", "dropbox", "adobe"] },
-  { name: "Education", keys: ["tuition", "school", "university", "college", "course", "udemy", "coursera", "book", "textbook"] },
-  { name: "Insurance", keys: ["insurance", "geico", "allstate", "state farm", "progressive", "liberty mutual", "policy"] },
-  { name: "Income", keys: ["payroll", "salary", "direct dep", "deposit from", "wage", "dividend", "interest earned", "refund", "cashback", "reimbursement", "venmo from", "zelle from", "ach credit", "paycheck"] },
-  { name: "Transfers", keys: ["transfer", "zelle to", "venmo to", "paypal", "wire", "ach debit"] },
-  { name: "Fitness", keys: ["gym", "fitness", "peloton", "yoga", "crossfit", "planet fitness", "equinox"] },
-  { name: "Childcare", keys: ["daycare", "childcare", "babysit", "nanny", "tutor", "school fee"] },
-  { name: "Pets", keys: ["vet", "veterinar", "pet", "petco", "petsmart", "chewy"] },
-];
-
-// ── Categorizer ──────────────────────────────────────────
-function categorize(desc: string): string {
-  const d = desc.toLowerCase();
-  for (const cat of CATEGORIES) {
-    if (cat.keys.some((k) => d.includes(k))) return cat.name;
-  }
-  return "Other";
-}
-
-// ── PDF extraction ───────────────────────────────────────
-import type { TextItem } from "pdfjs-dist/types/src/display/api";
-
-async function extractPdf(file: File): Promise<string> {
-  const buf = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
-  const pages: string[] = [];
-
-  for (let p = 1; p <= pdf.numPages; p++) {
-    const pg = await pdf.getPage(p);
-    const ct = await pg.getTextContent();
-    const textItems = ct.items.filter((it): it is TextItem => "str" in it);
-    const sorted = [...textItems].sort((a, b) => {
-      const dy = b.transform[5] - a.transform[5];
-      return Math.abs(dy) > 3 ? dy : a.transform[4] - b.transform[4];
-    });
-
-    const lines: string[] = [];
-    let lastY: number | null = null;
-    let cur = "";
-    for (const it of sorted) {
-      if (lastY !== null && Math.abs(it.transform[5] - lastY) > 3) {
-        if (cur.trim()) lines.push(cur.trim());
-        cur = "";
-      }
-      cur += (cur ? "  " : "") + it.str;
-      lastY = it.transform[5];
-    }
-    if (cur.trim()) lines.push(cur.trim());
-    pages.push(lines.join("\n"));
-  }
-  return pages.join("\n\n");
-}
-
-// ── Transaction parser ───────────────────────────────────
-function parseTxns(text: string): Transaction[] {
-  const lines = text.split("\n").filter((l) => l.trim());
-  let txns: Transaction[] = [];
-
-  // Strategy 1: CSV
-  const csvLines = lines.filter((l) => l.split(",").length >= 3);
-  if (csvLines.length > lines.length * 0.3) {
-    let hi = lines.findIndex((l) => /date/i.test(l) && /amount|debit|credit|balance/i.test(l));
-    if (hi === -1) hi = 0;
-    const hdr = lines[hi].split(",").map((h) => h.trim().toLowerCase().replace(/"/g, ""));
-    const dc = hdr.findIndex((h) => /date/i.test(h));
-    const ds = hdr.findIndex((h) => /desc|memo|narr|detail|merchant|payee|name/i.test(h));
-    const ac = hdr.findIndex((h) => /^amount$|^value$/i.test(h));
-    const dbc = hdr.findIndex((h) => /debit|withdrawal|expense/i.test(h));
-    const crc = hdr.findIndex((h) => /credit|deposit/i.test(h));
-
-    for (let i = hi + 1; i < lines.length; i++) {
-      const cols = lines[i].match(/(".*?"|[^,]+)/g)?.map((c) => c.trim().replace(/^"|"$/g, "")) || [];
-      if (cols.length < 2) continue;
-      const date = dc >= 0 ? cols[dc] : cols[0];
-      const d = ds >= 0 ? cols[ds] : cols[1];
-      let amt = 0;
-      if (ac >= 0) {
-        amt = parseFloat(cols[ac]?.replace(/[$,\s"]/g, "") ?? "") || 0;
-      } else {
-        const db = dbc >= 0 ? parseFloat(cols[dbc]?.replace(/[$,\s"]/g, "") ?? "") || 0 : 0;
-        const cr = crc >= 0 ? parseFloat(cols[crc]?.replace(/[$,\s"]/g, "") ?? "") || 0 : 0;
-        amt = cr > 0 ? cr : -db;
-      }
-      if (date && d && amt !== 0) {
-        txns.push({ date, description: d, amount: amt, category: categorize(d) });
-      }
-    }
-  }
-
-  // Strategy 2: Regex patterns
-  if (!txns.length) {
-    const pats = [
-      /(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\s+(.+?)\s+([-−]?\$?[\d,]+\.\d{2})\s*$/gm,
-      /(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\s{2,}(.+?)\s{2,}([-−]?\$?[\d,]+\.\d{2})/gm,
-      /(\d{4}-\d{2}-\d{2})\s+(.+?)\s+([-−]?\$?[\d,]+\.\d{2})/gm,
-    ];
-    for (const pat of pats) {
-      pat.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = pat.exec(text)) !== null) {
-        const raw = m[3].replace(/[$,\s]/g, "").replace("−", "-");
-        const amt = parseFloat(raw);
-        if (!isNaN(amt) && Math.abs(amt) > 0.01 && Math.abs(amt) < 1e6) {
-          const d = m[2].trim().replace(/\s{2,}/g, " ");
-          if (d.length >= 3 && !/^[\d.]+$/.test(d)) {
-            txns.push({ date: m[1], description: d, amount: amt, category: categorize(d) });
-          }
-        }
-      }
-      if (txns.length > 2) break;
-    }
-  }
-
-  // Strategy 3: Dollar amounts at end of line
-  if (!txns.length) {
-    for (const line of lines) {
-      const dm = line.match(/^(.+?)\s+([-−]?\$[\d,]+\.\d{2})\s*$/);
-      if (dm) {
-        const d = dm[1].trim();
-        const raw = dm[2].replace(/[$,]/g, "").replace("−", "-");
-        const amt = parseFloat(raw);
-        if (!isNaN(amt) && d.length >= 3) {
-          const dateM = d.match(/^(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\s+(.+)/);
-          txns.push({
-            date: dateM ? dateM[1] : "—",
-            description: dateM ? dateM[2].trim() : d,
-            amount: amt,
-            category: categorize(d),
-          });
-        }
-      }
-    }
-  }
-
-  // Dedupe
-  const seen = new Set<string>();
-  return txns.filter((t) => {
-    const k = `${t.date}|${t.description.slice(0, 20)}|${t.amount}`;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-}
-
-// ── Helpers ──────────────────────────────────────────────
-function inferBank(n: string): string {
-  const l = n.toLowerCase();
-  const map: [string, string][] = [
-    ["chase","Chase"],["bofa","Bank of America"],["bank_of_america","Bank of America"],
-    ["wells","Wells Fargo"],["citi","Citibank"],["amex","Amex"],["capital","Capital One"],
-    ["discover","Discover"],["usaa","USAA"],["schwab","Schwab"],["fidelity","Fidelity"],
-  ];
-  for (const [k, v] of map) if (l.includes(k)) return v;
-  return "Statement";
-}
-
-function fmtSize(b: number): string {
-  if (b < 1024) return b + " B";
-  if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
-  return (b / 1048576).toFixed(1) + " MB";
-}
-
 function fmtAmt(n: number): string {
   return (n >= 0 ? "+" : "") + "$" + Math.abs(n).toLocaleString("en", { minimumFractionDigits: 2 });
-}
-
-// ── Persistence ──────────────────────────────────────────
-interface StoredStatement {
-  id: string; name: string; bank: string; date: string;
-  size: string; content: string; isPdf: boolean;
-}
-
-function saveData(stmts: Statement[]): void {
-  try {
-    const data: StoredStatement[] = stmts.map((s) => ({
-      id: s.id, name: s.name, bank: s.bank, date: s.date,
-      size: s.size, content: s.content.slice(0, 60000), isPdf: s.isPdf,
-    }));
-    localStorage.setItem("ledgr-data", JSON.stringify(data));
-  } catch (e) { console.warn("Save failed:", e); }
-}
-
-function loadData(): Statement[] {
-  try {
-    const raw = localStorage.getItem("ledgr-data");
-    if (raw) {
-      return (JSON.parse(raw) as StoredStatement[]).map((s) => ({
-        ...s, transactions: parseTxns(s.content),
-      }));
-    }
-  } catch (e) { console.warn("Load failed:", e); }
-  return [];
 }
 
 // ── Chart components ─────────────────────────────────────
@@ -318,11 +102,11 @@ type SortDir = "asc" | "desc";
 // ═══════════════════════════════════════════════════════════
 export default function App() {
   const [tab, setTab] = useState<TabName>("statements");
-  const [stmts, setStmts] = useState<Statement[]>([]);
+  const [stmts, setStmts] = useState<DbStatement[]>([]);
+  const [txns, setTxns] = useState<DbTransaction[]>([]);
   const [ready, setReady] = useState(false);
   const [drag, setDrag] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [rawId, setRawId] = useState<string | null>(null);
   const [ledgerSearch, setLedgerSearch] = useState("");
   const [ledgerCat, setLedgerCat] = useState("All");
   const [ledgerBank, setLedgerBank] = useState("All");
@@ -330,53 +114,154 @@ export default function App() {
   const [ledgerDir, setLedgerDir] = useState<SortDir>("desc");
   const [ledgerPage, setLedgerPage] = useState(0);
   const [analysisCat, setAnalysisCat] = useState<string | null>(null);
+  const [uploadType, setUploadType] = useState<StatementType>("bank");
   const fRef = useRef<HTMLInputElement>(null);
+  const importRef = useRef<HTMLInputElement>(null);
   const ROWS = 25;
 
-  useEffect(() => { setStmts(loadData()); setReady(true); }, []);
-  useEffect(() => { if (ready) saveData(stmts); }, [stmts, ready]);
-
-  const onFiles = useCallback(async (files: File[]) => {
-    setBusy(true);
-    const added: Statement[] = [];
-    for (const f of files) {
-      let text = "";
-      const isPdf = f.name.toLowerCase().endsWith(".pdf");
+  useEffect(() => {
+    (async () => {
       try {
-        if (isPdf) {
-          text = await extractPdf(f);
-        } else {
-          text = await new Promise<string>((res) => {
-            const fr = new FileReader();
-            fr.onload = (e) => res(e.target?.result as string);
-            fr.readAsText(f);
-          });
-        }
+        const [s, t] = await Promise.all([getAllStatements(), getAllTransactions()]);
+        setStmts(s);
+        setTxns(t);
       } catch (e) {
-        text = `[Error: ${(e as Error).message}]`;
+        console.warn("Load failed:", e);
       }
-      added.push({
+      setReady(true);
+    })();
+  }, []);
+
+  const onFiles = useCallback(async (files: File[], type: StatementType) => {
+    setBusy(true);
+    for (const f of files) {
+      const isPdf = f.name.toLowerCase().endsWith(".pdf");
+      let text = "";
+      try {
+        text = isPdf ? await extractPdf(f) : await readTextFile(f);
+      } catch (e) {
+        console.error("Parse failed for", f.name, e);
+        continue;
+      }
+      const parsed = parseTxns(text, type);
+      const stmt: DbStatement = {
         id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
         name: f.name,
         bank: inferBank(f.name),
         date: new Date().toLocaleDateString("en-US", { month: "short", year: "numeric" }),
-        content: text,
         size: fmtSize(f.size),
-        transactions: parseTxns(text),
+        txnCount: parsed.length,
         isPdf,
-      });
+        type,
+      };
+      const dbTxns: Omit<DbTransaction, "id">[] = parsed.map((p) => ({
+        stmtId: stmt.id,
+        date: p.date,
+        description: p.description,
+        amount: p.amount,
+        category: p.category,
+      }));
+      try {
+        await addStatement(stmt, dbTxns);
+        setStmts((p) => [...p, stmt]);
+        setTxns((p) => [...p, ...(dbTxns as DbTransaction[])]);
+      } catch (e) {
+        console.error("DB write failed:", e);
+      }
     }
-    setStmts((p) => [...p, ...added]);
     setBusy(false);
   }, []);
 
-  const remove = (id: string) => setStmts((p) => p.filter((s) => s.id !== id));
+  const remove = async (id: string) => {
+    try {
+      await deleteStatement(id);
+      setStmts((p) => p.filter((s) => s.id !== id));
+      setTxns((p) => p.filter((t) => t.stmtId !== id));
+    } catch (e) { console.error("Delete failed:", e); }
+  };
+
+  const onClearAll = async () => {
+    if (!confirm("Delete all statements and transactions? This cannot be undone.")) return;
+    try {
+      await clearAll();
+      setStmts([]);
+      setTxns([]);
+    } catch (e) { console.error("Clear failed:", e); }
+  };
+
+  const onExport = async () => {
+    try {
+      const payload = await exportData();
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `ledgr-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) { console.error("Export failed:", e); alert("Export failed: " + (e as Error).message); }
+  };
+
+  const onRecategorize = async () => {
+    const updates: { id: number; category: string }[] = [];
+    for (const t of txns) {
+      if (t.id === undefined) continue;
+      const newCat = categorize(t.description);
+      if (newCat !== t.category) updates.push({ id: t.id, category: newCat });
+    }
+    if (!updates.length) {
+      alert("No category changes needed.");
+      return;
+    }
+    try {
+      await updateTransactionCategories(updates);
+      const updatedMap = new Map(updates.map((u) => [u.id, u.category]));
+      setTxns((p) => p.map((t) => (t.id !== undefined && updatedMap.has(t.id) ? { ...t, category: updatedMap.get(t.id)! } : t)));
+      alert(`Re-categorized ${updates.length} transaction${updates.length === 1 ? "" : "s"}.`);
+    } catch (e) {
+      console.error("Recategorize failed:", e);
+      alert("Re-categorize failed: " + (e as Error).message);
+    }
+  };
+
+  const onImport = async (file: File) => {
+    if (!confirm("Replace ALL current data with this backup? This cannot be undone.")) return;
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text) as BackupPayload;
+      await importData(payload);
+      const [s, t] = await Promise.all([getAllStatements(), getAllTransactions()]);
+      setStmts(s);
+      setTxns(t);
+      alert(`Restored ${s.length} statements and ${t.length} transactions.`);
+    } catch (e) {
+      console.error("Import failed:", e);
+      alert("Import failed: " + (e as Error).message);
+    }
+  };
 
   // ── Computed ─────────────────────────────────
+  const bankByStmt = useMemo(() => {
+    const m: Record<string, string> = {};
+    stmts.forEach((s) => { m[s.id] = s.bank; });
+    return m;
+  }, [stmts]);
+
+  const currentYear = new Date().getFullYear();
   const allTxns: TransactionWithMeta[] = useMemo(
-    () => stmts.flatMap((s) => s.transactions.map((t) => ({ ...t, bank: s.bank, stmtId: s.id }))),
-    [stmts]
+    () => txns.map((t) => ({
+      date: normalizeDate(t.date, currentYear),
+      description: t.description,
+      amount: t.amount,
+      category: t.category,
+      bank: bankByStmt[t.stmtId] ?? "Unknown",
+      stmtId: t.stmtId,
+    })),
+    [txns, bankByStmt, currentYear]
   );
+
   const debits = useMemo(() => allTxns.filter((t) => t.amount < 0), [allTxns]);
   const credits = useMemo(() => allTxns.filter((t) => t.amount > 0), [allTxns]);
   const totalIn = credits.reduce((a, t) => a + t.amount, 0);
@@ -393,12 +278,7 @@ export default function App() {
   const monthlyData: MonthlyDataItem[] = useMemo(() => {
     const mm: Record<string, MonthlyDataItem> = {};
     allTxns.forEach((t) => {
-      const d = t.date || "";
-      let key = "Unknown";
-      const m1 = d.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
-      const m2 = d.match(/(\d{4})-(\d{2})/);
-      if (m1) { const yr = m1[3].length === 2 ? "20" + m1[3] : m1[3]; key = `${yr}-${m1[1].padStart(2, "0")}`; }
-      else if (m2) key = `${m2[1]}-${m2[2]}`;
+      const key = t.date.match(/^(\d{4})-(\d{2})/)?.[0] ?? "Unknown";
       if (!mm[key]) mm[key] = { month: key, income: 0, expenses: 0 };
       if (t.amount > 0) mm[key].income += t.amount; else mm[key].expenses += Math.abs(t.amount);
     });
@@ -423,6 +303,10 @@ export default function App() {
 
   const btn: React.CSSProperties = { fontFamily: fM, fontSize: "0.58rem", letterSpacing: "0.08em", textTransform: "uppercase", padding: "6px 12px", cursor: "pointer", borderRadius: 1 };
   const tabList: TabName[] = ["statements", "ledger", "analysis", "overview"];
+
+  if (!ready) {
+    return <div style={{ fontFamily: fM, background: C.cream, minHeight: "100vh", display: "grid", placeItems: "center", color: C.muted, fontSize: "0.7rem", letterSpacing: "0.1em", textTransform: "uppercase" }}>Loading…</div>;
+  }
 
   return (
     <div style={{ fontFamily: fM, background: C.cream, color: C.ink, minHeight: "100vh", fontSize: 13 }}>
@@ -449,15 +333,37 @@ export default function App() {
         {/* STATEMENTS */}
         {tab === "statements" && (<div>
           <div style={{ fontFamily: fH, fontSize: "1.7rem", fontWeight: 300, marginBottom: 4 }}>Bank Statements</div>
-          <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", color: C.muted, textTransform: "uppercase", marginBottom: 22 }}>Upload PDF, CSV, or TXT · processed on your machine</div>
+          <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", color: C.muted, textTransform: "uppercase", marginBottom: 14 }}>Upload PDF, CSV, or TXT · processed on your machine</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+            <span style={{ fontSize: "0.55rem", letterSpacing: "0.12em", textTransform: "uppercase", color: C.muted }}>Statement type:</span>
+            {(["bank", "credit", "investment"] as const).map((t) => {
+              const labels: Record<StatementType, string> = { bank: "Bank Account", credit: "Credit Card", investment: "Investment" };
+              const active = uploadType === t;
+              return (
+                <button key={t} onClick={() => setUploadType(t)} disabled={busy}
+                  style={{
+                    fontFamily: fM, fontSize: "0.58rem", letterSpacing: "0.08em", textTransform: "uppercase",
+                    padding: "5px 12px", cursor: busy ? "not-allowed" : "pointer", borderRadius: 1,
+                    background: active ? C.ink : "none",
+                    color: active ? C.parchment : C.muted,
+                    border: `1px solid ${active ? C.ink : C.border}`,
+                  }}>
+                  {labels[t]}
+                </button>
+              );
+            })}
+            <span style={{ fontSize: "0.55rem", color: C.muted, marginLeft: "auto" }}>
+              {uploadType === "credit" ? "Charges treated as expenses (sign flipped)" : uploadType === "investment" ? "Signs preserved as-is" : "+ income, − expenses"}
+            </span>
+          </div>
           <div style={{ border: `1.5px dashed ${drag ? C.gold : C.border}`, padding: "40px 24px", textAlign: "center", cursor: busy ? "wait" : "pointer", background: drag ? "#fffbf0" : C.card, borderRadius: 2 }}
             onClick={() => !busy && fRef.current?.click()}
             onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
-            onDrop={(e) => { e.preventDefault(); setDrag(false); onFiles(Array.from(e.dataTransfer.files)); }}>
+            onDrop={(e) => { e.preventDefault(); setDrag(false); onFiles(Array.from(e.dataTransfer.files), uploadType); }}>
             {busy
-              ? <><span style={{ display: "inline-block", width: 24, height: 24, border: `2px solid ${C.border}`, borderTopColor: C.gold, borderRadius: "50%", animation: "spin 0.8s linear infinite", marginBottom: 10 }} /><div style={{ fontFamily: fH, fontSize: "1rem" }}>Processing PDF…</div></>
+              ? <><span style={{ display: "inline-block", width: 24, height: 24, border: `2px solid ${C.border}`, borderTopColor: C.gold, borderRadius: "50%", animation: "spin 0.8s linear infinite", marginBottom: 10 }} /><div style={{ fontFamily: fH, fontSize: "1rem" }}>Processing…</div></>
               : <><div style={{ width: 40, height: 40, margin: "0 auto 12px", border: `1.5px solid ${drag ? C.gold : C.border}`, borderRadius: "50%", display: "grid", placeItems: "center", color: drag ? C.gold : C.muted, fontSize: "1rem" }}>↑</div><div style={{ fontFamily: fH, fontSize: "1.1rem", marginBottom: 4 }}>Drop statements here</div><div style={{ fontSize: "0.55rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.1em" }}>PDF · CSV · TXT — multiple files supported</div></>}
-            <input ref={fRef} type="file" accept=".pdf,.csv,.txt,.tsv" multiple style={{ display: "none" }} onChange={(e) => { if (e.target.files) onFiles(Array.from(e.target.files)); e.target.value = ""; }} />
+            <input ref={fRef} type="file" accept=".pdf,.csv,.txt,.tsv" multiple style={{ display: "none" }} onChange={(e) => { if (e.target.files) onFiles(Array.from(e.target.files), uploadType); e.target.value = ""; }} />
           </div>
           {stmts.length === 0 && !busy ? (
             <div style={{ textAlign: "center", padding: "50px 20px", color: C.muted }}><div style={{ fontSize: "2rem", marginBottom: 12, opacity: 0.3 }}>🏦</div><div style={{ fontFamily: fH, fontSize: "1.2rem", fontWeight: 300, color: C.ink }}>No statements yet</div></div>
@@ -465,16 +371,25 @@ export default function App() {
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 12, marginTop: 20 }}>
               {stmts.map((st) => (
                 <div key={st.id} style={{ background: C.card, border: `1px solid ${C.border}`, padding: "16px 18px", borderRadius: 2, animation: "fadeIn 0.3s ease" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start", gap: 6 }}>
                     <div><div style={{ fontFamily: fH, fontSize: "1rem", fontWeight: 600, marginBottom: 2 }}>{st.bank}</div><div style={{ fontSize: "0.55rem", letterSpacing: "0.08em", color: C.muted, textTransform: "uppercase" }}>{st.name} · {st.size}</div></div>
-                    {st.isPdf && <span style={{ fontSize: "0.48rem", color: C.rust, border: `1px solid ${C.rust}40`, padding: "2px 5px", textTransform: "uppercase" }}>PDF</span>}
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                      {(() => {
+                        const meta: Record<StatementType, { label: string; color: string }> = {
+                          bank: { label: "Bank", color: C.teal },
+                          credit: { label: "Credit", color: C.gold },
+                          investment: { label: "Invest", color: C.blue },
+                        };
+                        const m = meta[st.type ?? "bank"];
+                        return <span style={{ fontSize: "0.48rem", color: m.color, border: `1px solid ${m.color}55`, padding: "2px 5px", textTransform: "uppercase", letterSpacing: "0.08em" }}>{m.label}</span>;
+                      })()}
+                      {st.isPdf && <span style={{ fontSize: "0.48rem", color: C.rust, border: `1px solid ${C.rust}40`, padding: "2px 5px", textTransform: "uppercase" }}>PDF</span>}
+                    </div>
                   </div>
-                  <div style={{ fontSize: "0.6rem", color: st.transactions.length > 0 ? C.sage : C.rust, margin: "8px 0 12px" }}>{st.transactions.length > 0 ? `${st.transactions.length} transactions ✓` : "No transactions parsed"}</div>
+                  <div style={{ fontSize: "0.6rem", color: st.txnCount > 0 ? C.sage : C.rust, margin: "8px 0 12px" }}>{st.txnCount > 0 ? `${st.txnCount} transactions ✓` : "No transactions parsed"}</div>
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                    <button style={{ ...btn, background: "none", color: C.muted, border: `1px solid ${C.border}` }} onClick={() => setRawId(rawId === st.id ? null : st.id)}>{rawId === st.id ? "Hide" : "Raw"}</button>
                     <button style={{ ...btn, background: "none", color: C.rust, border: "1px solid transparent" }} onClick={() => remove(st.id)}>Remove</button>
                   </div>
-                  {rawId === st.id && <pre style={{ marginTop: 10, padding: 10, background: C.parchment, border: `1px solid ${C.border}`, borderRadius: 2, fontSize: "0.55rem", lineHeight: 1.5, maxHeight: 200, overflowY: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{st.content.slice(0, 8000)}</pre>}
                 </div>
               ))}
             </div>
@@ -630,11 +545,12 @@ export default function App() {
             <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 2, padding: 20, marginBottom: 20 }}>
               <div style={{ fontSize: "0.55rem", letterSpacing: "0.12em", textTransform: "uppercase", color: C.muted, marginBottom: 14 }}>Accounts</div>
               {stmts.map((st) => {
-                const si = st.transactions.filter((t) => t.amount > 0).reduce((a, t) => a + t.amount, 0);
-                const so = st.transactions.filter((t) => t.amount < 0).reduce((a, t) => a + Math.abs(t.amount), 0);
+                const stTxns = txns.filter((t) => t.stmtId === st.id);
+                const si = stTxns.filter((t) => t.amount > 0).reduce((a, t) => a + t.amount, 0);
+                const so = stTxns.filter((t) => t.amount < 0).reduce((a, t) => a + Math.abs(t.amount), 0);
                 return (
                   <div key={st.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px solid ${C.border}20`, fontSize: "0.68rem" }}>
-                    <div><strong>{st.bank}</strong> <span style={{ color: C.muted, fontSize: "0.55rem" }}>({st.transactions.length} txns · {st.name})</span></div>
+                    <div><strong>{st.bank}</strong> <span style={{ color: C.muted, fontSize: "0.55rem" }}>({st.txnCount} txns · {st.name})</span></div>
                     <div style={{ display: "flex", gap: 14 }}>
                       <span style={{ color: C.sage }}>+${si.toLocaleString("en", { minimumFractionDigits: 0 })}</span>
                       <span style={{ color: C.rust }}>-${so.toLocaleString("en", { minimumFractionDigits: 0 })}</span>
@@ -650,11 +566,25 @@ export default function App() {
                 {pieData[0] && <div>• Top expense: <strong>{pieData[0].name}</strong> at ${pieData[0].value.toLocaleString()} ({(pieData[0].value / totalOut * 100).toFixed(0)}%)</div>}
               </div>
             </div>
-            <div style={{ textAlign: "center" }}>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+              <button style={{ ...btn, background: "none", color: C.gold, border: `1px solid ${C.gold}40`, padding: "9px 24px" }}
+                onClick={onRecategorize}>
+                Re-categorize
+              </button>
+              <button style={{ ...btn, background: "none", color: C.sage, border: `1px solid ${C.sage}40`, padding: "9px 24px" }}
+                onClick={onExport}>
+                Export Backup
+              </button>
+              <button style={{ ...btn, background: "none", color: C.blue, border: `1px solid ${C.blue}40`, padding: "9px 24px" }}
+                onClick={() => importRef.current?.click()}>
+                Import Backup
+              </button>
               <button style={{ ...btn, background: "none", color: C.rust, border: `1px solid ${C.rust}40`, padding: "9px 24px" }}
-                onClick={() => { localStorage.removeItem("ledgr-data"); setStmts([]); }}>
+                onClick={onClearAll}>
                 Clear All Data
               </button>
+              <input ref={importRef} type="file" accept=".json,application/json" style={{ display: "none" }}
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) onImport(f); e.target.value = ""; }} />
             </div>
           </>)}
         </div>)}

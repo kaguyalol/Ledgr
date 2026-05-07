@@ -21,18 +21,18 @@ Opens at **http://localhost:3000**
 - **Vite** for dev/build
 - **Recharts** for charts
 - **pdf.js** for local PDF text extraction
-- **localStorage** for persistence
+- **IndexedDB** for persistence (statements + transactions stores)
 - **GitHub Pages** for hosting (via GitHub Actions)
 
 ## Features
 
 | Tab | What it does |
 |-----|-------------|
-| **Statements** | Upload PDF/CSV/TXT bank statements. View extracted raw text. |
+| **Statements** | Upload PDF/CSV/TXT bank statements. Parsed transactions are stored locally; raw files are discarded. |
 | **Ledger** | Full transaction table with search, filter by category/account, sortable columns, pagination. |
 | **Analysis** | Interactive pie chart (click to drill down), category breakdown, monthly income vs expenses bar chart. |
 | **Overview** | Aggregate metrics, per-account summary, auto-generated insights. |
 
 ## Privacy
 
-Zero network calls. All data stays in your browser's `localStorage`. GitHub Pages only serves the static app code — it never sees your financial data.
+Zero network calls. All data stays in your browser's IndexedDB. Raw PDFs are parsed in memory and discarded — only structured transaction data is persisted. GitHub Pages only serves the static app code — it never sees your financial data.
