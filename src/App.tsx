@@ -6,11 +6,11 @@ import {
 import {
   addStatement, getAllStatements, getAllTransactions,
   deleteStatement, clearAll, exportData, importData,
-  updateTransactionCategories,
+  updateTransactionCategories, updateStatementBank,
   type DbStatement, type DbTransaction, type BackupPayload,
   type StatementType,
 } from "./db";
-import { extractPdf, readTextFile, parseTxns, categorize, inferBank, fmtSize, normalizeDate } from "./parser";
+import { extractPdf, readTextFile, parseTxns, parseInvestmentSummary, categorize, inferBank, fmtSize, normalizeDate } from "./parser";
 
 // ── Types ────────────────────────────────────────────────
 interface TransactionWithMeta {
@@ -95,7 +95,7 @@ function ChartTooltip({ active, payload, label }: {
 }
 
 // ── Tabs ─────────────────────────────────────────────────
-type TabName = "statements" | "ledger" | "analysis" | "overview";
+type TabName = "statements" | "ledger" | "analysis" | "investments" | "overview";
 type SortKey = "date" | "amount" | "category" | "description" | "bank";
 type SortDir = "asc" | "desc";
 
@@ -110,11 +110,13 @@ export default function App() {
   const [ledgerSearch, setLedgerSearch] = useState("");
   const [ledgerCat, setLedgerCat] = useState("All");
   const [ledgerBank, setLedgerBank] = useState("All");
+  const [ledgerMonth, setLedgerMonth] = useState("All");
   const [ledgerSort, setLedgerSort] = useState<SortKey>("date");
   const [ledgerDir, setLedgerDir] = useState<SortDir>("desc");
   const [ledgerPage, setLedgerPage] = useState(0);
   const [analysisCat, setAnalysisCat] = useState<string | null>(null);
   const [uploadType, setUploadType] = useState<StatementType>("bank");
+  const [uploadBank, setUploadBank] = useState<string>("");
   const fRef = useRef<HTMLInputElement>(null);
   const importRef = useRef<HTMLInputElement>(null);
   const ROWS = 25;
@@ -132,7 +134,7 @@ export default function App() {
     })();
   }, []);
 
-  const onFiles = useCallback(async (files: File[], type: StatementType) => {
+  const onFiles = useCallback(async (files: File[], type: StatementType, bankOverride: string) => {
     setBusy(true);
     for (const f of files) {
       const isPdf = f.name.toLowerCase().endsWith(".pdf");
@@ -144,15 +146,17 @@ export default function App() {
         continue;
       }
       const parsed = parseTxns(text, type);
+      const summary = type === "investment" ? parseInvestmentSummary(text) ?? undefined : undefined;
       const stmt: DbStatement = {
         id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
         name: f.name,
-        bank: inferBank(f.name),
+        bank: bankOverride.trim() || inferBank(f.name, text),
         date: new Date().toLocaleDateString("en-US", { month: "short", year: "numeric" }),
         size: fmtSize(f.size),
         txnCount: parsed.length,
         isPdf,
         type,
+        summary,
       };
       const dbTxns: Omit<DbTransaction, "id">[] = parsed.map((p) => ({
         stmtId: stmt.id,
@@ -262,12 +266,48 @@ export default function App() {
     [txns, bankByStmt, currentYear]
   );
 
-  const debits = useMemo(() => allTxns.filter((t) => t.amount < 0), [allTxns]);
-  const credits = useMemo(() => allTxns.filter((t) => t.amount > 0), [allTxns]);
+  const stmtTypeById = useMemo(() => {
+    const m: Record<string, StatementType> = {};
+    stmts.forEach((s) => { m[s.id] = s.type ?? "bank"; });
+    return m;
+  }, [stmts]);
+
+  const cashTxns = useMemo(
+    () => allTxns.filter((t) => stmtTypeById[t.stmtId] !== "investment"),
+    [allTxns, stmtTypeById]
+  );
+  const investTxns = useMemo(
+    () => allTxns.filter((t) => stmtTypeById[t.stmtId] === "investment"),
+    [allTxns, stmtTypeById]
+  );
+  const investStmts = useMemo(() => stmts.filter((s) => s.type === "investment"), [stmts]);
+
+  // For spending analysis: drop positive amounts on credit-card statements
+  // (those are payments/refunds, not real income — they'd inflate totals).
+  const analysisTxns = useMemo(
+    () => cashTxns.filter((t) => !(stmtTypeById[t.stmtId] === "credit" && t.amount > 0)),
+    [cashTxns, stmtTypeById]
+  );
+
+  const debits = useMemo(() => analysisTxns.filter((t) => t.amount < 0), [analysisTxns]);
+  const credits = useMemo(() => analysisTxns.filter((t) => t.amount > 0), [analysisTxns]);
   const totalIn = credits.reduce((a, t) => a + t.amount, 0);
   const totalOut = debits.reduce((a, t) => a + Math.abs(t.amount), 0);
   const banks = useMemo(() => [...new Set(stmts.map((s) => s.bank))], [stmts]);
   const cats = useMemo(() => [...new Set(allTxns.map((t) => t.category))].sort(), [allTxns]);
+  const months = useMemo(() => {
+    const set = new Set<string>();
+    allTxns.forEach((t) => {
+      const m = t.date.match(/^(\d{4}-\d{2})/)?.[1];
+      if (m) set.add(m);
+    });
+    return [...set].sort().reverse();
+  }, [allTxns]);
+  const monthLabel = (key: string): string => {
+    const [yr, mo] = key.split("-");
+    const d = new Date(parseInt(yr, 10), parseInt(mo, 10) - 1, 1);
+    return d.toLocaleDateString("en", { month: "short", year: "numeric" });
+  };
 
   const pieData: PieDataItem[] = useMemo(() => {
     const cm: Record<string, number> = {};
@@ -277,32 +317,33 @@ export default function App() {
 
   const monthlyData: MonthlyDataItem[] = useMemo(() => {
     const mm: Record<string, MonthlyDataItem> = {};
-    allTxns.forEach((t) => {
+    analysisTxns.forEach((t) => {
       const key = t.date.match(/^(\d{4})-(\d{2})/)?.[0] ?? "Unknown";
       if (!mm[key]) mm[key] = { month: key, income: 0, expenses: 0 };
       if (t.amount > 0) mm[key].income += t.amount; else mm[key].expenses += Math.abs(t.amount);
     });
     return Object.values(mm).sort((a, b) => a.month.localeCompare(b.month))
       .map((m) => ({ ...m, income: Math.round(m.income), expenses: Math.round(m.expenses) }));
-  }, [allTxns]);
+  }, [analysisTxns]);
 
   const filteredLedger = useMemo(() => {
     let list = allTxns;
     if (ledgerBank !== "All") list = list.filter((t) => t.bank === ledgerBank);
     if (ledgerCat !== "All") list = list.filter((t) => t.category === ledgerCat);
+    if (ledgerMonth !== "All") list = list.filter((t) => t.date.startsWith(ledgerMonth));
     if (ledgerSearch) { const q = ledgerSearch.toLowerCase(); list = list.filter((t) => t.description.toLowerCase().includes(q) || t.date.includes(q)); }
     return [...list].sort((a, b) => {
       if (ledgerSort === "amount") return ledgerDir === "desc" ? Math.abs(b.amount) - Math.abs(a.amount) : Math.abs(a.amount) - Math.abs(b.amount);
       if (ledgerSort === "category") return ledgerDir === "desc" ? b.category.localeCompare(a.category) : a.category.localeCompare(b.category);
       return ledgerDir === "desc" ? b.date.localeCompare(a.date) : a.date.localeCompare(b.date);
     });
-  }, [allTxns, ledgerBank, ledgerCat, ledgerSearch, ledgerSort, ledgerDir]);
+  }, [allTxns, ledgerBank, ledgerCat, ledgerMonth, ledgerSearch, ledgerSort, ledgerDir]);
 
   const ledgerPages = Math.ceil(filteredLedger.length / ROWS);
   const ledgerSlice = filteredLedger.slice(ledgerPage * ROWS, (ledgerPage + 1) * ROWS);
 
   const btn: React.CSSProperties = { fontFamily: fM, fontSize: "0.58rem", letterSpacing: "0.08em", textTransform: "uppercase", padding: "6px 12px", cursor: "pointer", borderRadius: 1 };
-  const tabList: TabName[] = ["statements", "ledger", "analysis", "overview"];
+  const tabList: TabName[] = ["statements", "ledger", "analysis", "investments", "overview"];
 
   if (!ready) {
     return <div style={{ fontFamily: fM, background: C.cream, minHeight: "100vh", display: "grid", placeItems: "center", color: C.muted, fontSize: "0.7rem", letterSpacing: "0.1em", textTransform: "uppercase" }}>Loading…</div>;
@@ -334,36 +375,52 @@ export default function App() {
         {tab === "statements" && (<div>
           <div style={{ fontFamily: fH, fontSize: "1.7rem", fontWeight: 300, marginBottom: 4 }}>Bank Statements</div>
           <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", color: C.muted, textTransform: "uppercase", marginBottom: 14 }}>Upload PDF, CSV, or TXT · processed on your machine</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-            <span style={{ fontSize: "0.55rem", letterSpacing: "0.12em", textTransform: "uppercase", color: C.muted }}>Statement type:</span>
-            {(["bank", "credit", "investment"] as const).map((t) => {
-              const labels: Record<StatementType, string> = { bank: "Bank Account", credit: "Credit Card", investment: "Investment" };
-              const active = uploadType === t;
-              return (
-                <button key={t} onClick={() => setUploadType(t)} disabled={busy}
-                  style={{
-                    fontFamily: fM, fontSize: "0.58rem", letterSpacing: "0.08em", textTransform: "uppercase",
-                    padding: "5px 12px", cursor: busy ? "not-allowed" : "pointer", borderRadius: 1,
-                    background: active ? C.ink : "none",
-                    color: active ? C.parchment : C.muted,
-                    border: `1px solid ${active ? C.ink : C.border}`,
-                  }}>
-                  {labels[t]}
-                </button>
-              );
-            })}
-            <span style={{ fontSize: "0.55rem", color: C.muted, marginLeft: "auto" }}>
-              {uploadType === "credit" ? "Charges treated as expenses (sign flipped)" : uploadType === "investment" ? "Signs preserved as-is" : "+ income, − expenses"}
-            </span>
-          </div>
+          {(() => {
+            const selectStyle: React.CSSProperties = { padding: "6px 10px", border: `1px solid ${C.border}`, background: C.card, borderRadius: 1, fontFamily: fM, fontSize: "0.65rem", cursor: busy ? "not-allowed" : "pointer", outline: "none" };
+            const labelStyle: React.CSSProperties = { fontSize: "0.55rem", letterSpacing: "0.12em", textTransform: "uppercase", color: C.muted };
+            const knownBanks = Array.from(new Set(stmts.map((s) => s.bank))).sort();
+            const showCustomOption = uploadBank && !knownBanks.includes(uploadBank);
+            return (
+              <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 14, flexWrap: "wrap" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={labelStyle}>Type</span>
+                  <select value={uploadType} onChange={(e) => setUploadType(e.target.value as StatementType)} disabled={busy} style={selectStyle}>
+                    <option value="bank">Bank Account</option>
+                    <option value="credit">Credit Card</option>
+                    <option value="investment">Investment</option>
+                  </select>
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={labelStyle}>Account</span>
+                  <select value={uploadBank} onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === "__new__") {
+                      const name = prompt("New account name:")?.trim();
+                      if (name) setUploadBank(name);
+                    } else {
+                      setUploadBank(v);
+                    }
+                  }} disabled={busy} style={{ ...selectStyle, minWidth: 140 }}>
+                    <option value="">Auto-detect</option>
+                    {knownBanks.map((b) => <option key={b} value={b}>{b}</option>)}
+                    {showCustomOption && <option value={uploadBank}>{uploadBank} (new)</option>}
+                    <option value="__new__">+ New account…</option>
+                  </select>
+                </label>
+                <span style={{ fontSize: "0.55rem", color: C.muted, marginLeft: "auto" }}>
+                  {uploadType === "credit" ? "Charges treated as expenses (sign flipped)" : uploadType === "investment" ? "Signs preserved as-is" : "+ income, − expenses"}
+                </span>
+              </div>
+            );
+          })()}
           <div style={{ border: `1.5px dashed ${drag ? C.gold : C.border}`, padding: "40px 24px", textAlign: "center", cursor: busy ? "wait" : "pointer", background: drag ? "#fffbf0" : C.card, borderRadius: 2 }}
             onClick={() => !busy && fRef.current?.click()}
             onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
-            onDrop={(e) => { e.preventDefault(); setDrag(false); onFiles(Array.from(e.dataTransfer.files), uploadType); }}>
+            onDrop={(e) => { e.preventDefault(); setDrag(false); onFiles(Array.from(e.dataTransfer.files), uploadType, uploadBank); }}>
             {busy
               ? <><span style={{ display: "inline-block", width: 24, height: 24, border: `2px solid ${C.border}`, borderTopColor: C.gold, borderRadius: "50%", animation: "spin 0.8s linear infinite", marginBottom: 10 }} /><div style={{ fontFamily: fH, fontSize: "1rem" }}>Processing…</div></>
               : <><div style={{ width: 40, height: 40, margin: "0 auto 12px", border: `1.5px solid ${drag ? C.gold : C.border}`, borderRadius: "50%", display: "grid", placeItems: "center", color: drag ? C.gold : C.muted, fontSize: "1rem" }}>↑</div><div style={{ fontFamily: fH, fontSize: "1.1rem", marginBottom: 4 }}>Drop statements here</div><div style={{ fontSize: "0.55rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.1em" }}>PDF · CSV · TXT — multiple files supported</div></>}
-            <input ref={fRef} type="file" accept=".pdf,.csv,.txt,.tsv" multiple style={{ display: "none" }} onChange={(e) => { if (e.target.files) onFiles(Array.from(e.target.files), uploadType); e.target.value = ""; }} />
+            <input ref={fRef} type="file" accept=".pdf,.csv,.txt,.tsv" multiple style={{ display: "none" }} onChange={(e) => { if (e.target.files) onFiles(Array.from(e.target.files), uploadType, uploadBank); e.target.value = ""; }} />
           </div>
           {stmts.length === 0 && !busy ? (
             <div style={{ textAlign: "center", padding: "50px 20px", color: C.muted }}><div style={{ fontSize: "2rem", marginBottom: 12, opacity: 0.3 }}>🏦</div><div style={{ fontFamily: fH, fontSize: "1.2rem", fontWeight: 300, color: C.ink }}>No statements yet</div></div>
@@ -372,7 +429,17 @@ export default function App() {
               {stmts.map((st) => (
                 <div key={st.id} style={{ background: C.card, border: `1px solid ${C.border}`, padding: "16px 18px", borderRadius: 2, animation: "fadeIn 0.3s ease" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start", gap: 6 }}>
-                    <div><div style={{ fontFamily: fH, fontSize: "1rem", fontWeight: 600, marginBottom: 2 }}>{st.bank}</div><div style={{ fontSize: "0.55rem", letterSpacing: "0.08em", color: C.muted, textTransform: "uppercase" }}>{st.name} · {st.size}</div></div>
+                    <div>
+                      <div title="Click to rename" onClick={async () => {
+                        const next = prompt("Account name:", st.bank)?.trim();
+                        if (!next || next === st.bank) return;
+                        try {
+                          await updateStatementBank(st.id, next);
+                          setStmts((p) => p.map((s) => (s.id === st.id ? { ...s, bank: next } : s)));
+                        } catch (e) { console.error("Rename failed:", e); }
+                      }} style={{ fontFamily: fH, fontSize: "1rem", fontWeight: 600, marginBottom: 2, cursor: "pointer" }}>{st.bank}</div>
+                      <div style={{ fontSize: "0.55rem", letterSpacing: "0.08em", color: C.muted, textTransform: "uppercase" }}>{st.name} · {st.size}</div>
+                    </div>
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
                       {(() => {
                         const meta: Record<StatementType, { label: string; color: string }> = {
@@ -412,6 +479,10 @@ export default function App() {
               <select value={ledgerBank} onChange={(e) => { setLedgerBank(e.target.value); setLedgerPage(0); }} style={{ padding: "7px 10px", border: `1px solid ${C.border}`, background: C.card, borderRadius: 1 }}>
                 <option value="All">All Accounts</option>
                 {banks.map((b) => <option key={b} value={b}>{b}</option>)}
+              </select>
+              <select value={ledgerMonth} onChange={(e) => { setLedgerMonth(e.target.value); setLedgerPage(0); }} style={{ padding: "7px 10px", border: `1px solid ${C.border}`, background: C.card, borderRadius: 1 }}>
+                <option value="All">All Months</option>
+                {months.map((m) => <option key={m} value={m}>{monthLabel(m)}</option>)}
               </select>
               <span style={{ fontSize: "0.58rem", color: C.muted }}>{filteredLedger.length} results</span>
             </div>
@@ -522,6 +593,120 @@ export default function App() {
           </>)}
         </div>)}
 
+        {/* INVESTMENTS */}
+        {tab === "investments" && (<div>
+          <div style={{ fontFamily: fH, fontSize: "1.7rem", fontWeight: 300, marginBottom: 4 }}>Investments</div>
+          <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", color: C.muted, textTransform: "uppercase", marginBottom: 24 }}>Account summary across investment statements</div>
+          {investStmts.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 48, color: C.muted }}>
+              <div style={{ fontFamily: fH, fontSize: "1.2rem", fontWeight: 300, color: C.ink }}>No investment statements yet</div>
+              <div style={{ fontSize: "0.58rem", marginTop: 8, letterSpacing: "0.06em" }}>Upload a PDF and pick "Investment" as the statement type.</div>
+            </div>
+          ) : (() => {
+            const fmt = (n: number) => `$${Math.abs(n).toLocaleString("en", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+            const fmtSigned = (n: number) => `${n >= 0 ? "+" : "−"}${fmt(n)}`;
+            // Latest statement per account (by periodEnd; fall back to upload order)
+            const latestByAccount: Record<string, DbStatement> = {};
+            for (const s of investStmts) {
+              const cur = latestByAccount[s.bank];
+              const sEnd = s.summary?.periodEnd ?? "";
+              const cEnd = cur?.summary?.periodEnd ?? "";
+              if (!cur || sEnd > cEnd) latestByAccount[s.bank] = s;
+            }
+            const totalEnding = Object.values(latestByAccount)
+              .reduce((a, s) => a + (s.summary?.endingValue ?? 0), 0);
+            const totalChange = investStmts
+              .reduce((a, s) => a + (s.summary?.changeInValue ?? 0), 0);
+            const totalContrib = investStmts
+              .reduce((a, s) => a + ((s.summary?.credits ?? 0) - (s.summary?.debits ?? 0)), 0);
+            const sortedStmts = [...investStmts].sort((a, b) => {
+              const aEnd = a.summary?.periodEnd ?? "";
+              const bEnd = b.summary?.periodEnd ?? "";
+              return bEnd.localeCompare(aEnd);
+            });
+            return (<>
+              {/* Aggregate top metrics */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 1, background: C.border, border: `1px solid ${C.border}`, borderRadius: 2, overflow: "hidden", marginBottom: 24 }}>
+                <div style={{ background: C.card, padding: "18px 16px" }}>
+                  <div style={{ fontSize: "0.55rem", letterSpacing: "0.14em", textTransform: "uppercase", color: C.muted, marginBottom: 5 }}>Total Account Value</div>
+                  <div style={{ fontFamily: fH, fontSize: "1.5rem", fontWeight: 300, color: C.ink }}>{totalEnding > 0 ? fmt(totalEnding) : "—"}</div>
+                  <div style={{ fontSize: "0.5rem", color: C.muted, marginTop: 4, letterSpacing: "0.06em" }}>Latest period across all accounts</div>
+                </div>
+                <div style={{ background: C.card, padding: "18px 16px" }}>
+                  <div style={{ fontSize: "0.55rem", letterSpacing: "0.14em", textTransform: "uppercase", color: C.muted, marginBottom: 5 }}>Period Change</div>
+                  <div style={{ fontFamily: fH, fontSize: "1.5rem", fontWeight: 300, color: totalChange >= 0 ? C.sage : C.rust }}>{fmtSigned(totalChange)}</div>
+                  <div style={{ fontSize: "0.5rem", color: C.muted, marginTop: 4, letterSpacing: "0.06em" }}>Market change summed across statements</div>
+                </div>
+                <div style={{ background: C.card, padding: "18px 16px" }}>
+                  <div style={{ fontSize: "0.55rem", letterSpacing: "0.14em", textTransform: "uppercase", color: C.muted, marginBottom: 5 }}>Net Contributions</div>
+                  <div style={{ fontFamily: fH, fontSize: "1.5rem", fontWeight: 300, color: totalContrib >= 0 ? C.sage : C.rust }}>{fmtSigned(totalContrib)}</div>
+                  <div style={{ fontSize: "0.5rem", color: C.muted, marginTop: 4, letterSpacing: "0.06em" }}>Credits − debits across statements</div>
+                </div>
+              </div>
+
+              {/* Per-statement summary cards */}
+              <div style={{ display: "grid", gap: 14 }}>
+                {sortedStmts.map((st) => {
+                  const sm = st.summary;
+                  const stTxns = investTxns.filter((t) => t.stmtId === st.id);
+                  if (!sm) {
+                    return (
+                      <div key={st.id} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 2, padding: "18px 20px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+                          <div style={{ fontFamily: fH, fontSize: "1.1rem", fontWeight: 600 }}>{st.bank}</div>
+                          <div style={{ fontSize: "0.55rem", color: C.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>{st.name}</div>
+                        </div>
+                        <div style={{ fontSize: "0.62rem", color: C.rust }}>
+                          Account summary not parsed — non-standard PDF format. {stTxns.length} transactions captured.
+                        </div>
+                      </div>
+                    );
+                  }
+                  const period = sm.periodStart && sm.periodEnd ? `${sm.periodStart} → ${sm.periodEnd}` : "Period unknown";
+                  return (
+                    <div key={st.id} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 2, padding: "18px 20px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
+                        <div>
+                          <div style={{ fontFamily: fH, fontSize: "1.2rem", fontWeight: 600 }}>{st.bank}</div>
+                          <div style={{ fontSize: "0.55rem", color: C.muted, letterSpacing: "0.08em", textTransform: "uppercase", marginTop: 2 }}>{period} · {st.name}</div>
+                        </div>
+                        <div style={{ textAlign: "right" }}>
+                          <div style={{ fontFamily: fH, fontSize: "1.4rem", fontWeight: 300, color: sm.changeInValue >= 0 ? C.sage : C.rust }}>{fmtSigned(sm.changeInValue)}</div>
+                          <div style={{ fontSize: "0.5rem", color: C.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Market change</div>
+                        </div>
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 12, fontSize: "0.65rem" }}>
+                        <div>
+                          <div style={{ fontSize: "0.5rem", letterSpacing: "0.08em", textTransform: "uppercase", color: C.muted, marginBottom: 3 }}>Beginning</div>
+                          <div style={{ fontFamily: fH, fontSize: "1rem" }}>{fmt(sm.beginningValue)}</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: "0.5rem", letterSpacing: "0.08em", textTransform: "uppercase", color: C.muted, marginBottom: 3 }}>Ending</div>
+                          <div style={{ fontFamily: fH, fontSize: "1rem", color: C.ink }}>{fmt(sm.endingValue)}</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: "0.5rem", letterSpacing: "0.08em", textTransform: "uppercase", color: C.muted, marginBottom: 3 }}>Credits</div>
+                          <div style={{ fontFamily: fH, fontSize: "1rem", color: sm.credits > 0 ? C.sage : C.muted }}>{sm.credits > 0 ? fmt(sm.credits) : "—"}</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: "0.5rem", letterSpacing: "0.08em", textTransform: "uppercase", color: C.muted, marginBottom: 3 }}>Debits</div>
+                          <div style={{ fontFamily: fH, fontSize: "1rem", color: sm.debits > 0 ? C.rust : C.muted }}>{sm.debits > 0 ? fmt(sm.debits) : "—"}</div>
+                        </div>
+                        {sm.securityTransfers !== 0 && (
+                          <div>
+                            <div style={{ fontSize: "0.5rem", letterSpacing: "0.08em", textTransform: "uppercase", color: C.muted, marginBottom: 3 }}>Sec. Transfers</div>
+                            <div style={{ fontFamily: fH, fontSize: "1rem" }}>{fmtSigned(sm.securityTransfers)}</div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>);
+          })()}
+        </div>)}
+
         {/* OVERVIEW */}
         {tab === "overview" && (<div>
           <div style={{ fontFamily: fH, fontSize: "1.7rem", fontWeight: 300, marginBottom: 4 }}>Portfolio Overview</div>
@@ -531,7 +716,7 @@ export default function App() {
               { l: "Statements", v: String(stmts.length) },
               { l: "Total Inflows", v: totalIn > 0 ? `$${totalIn.toLocaleString("en", { minimumFractionDigits: 0 })}` : "—", c: C.sage },
               { l: "Total Outflows", v: totalOut > 0 ? `$${totalOut.toLocaleString("en", { minimumFractionDigits: 0 })}` : "—", c: C.rust },
-              { l: "Net Position", v: allTxns.length > 0 ? `${totalIn - totalOut >= 0 ? "+" : ""}$${(totalIn - totalOut).toLocaleString("en", { minimumFractionDigits: 0 })}` : "—", c: totalIn - totalOut >= 0 ? C.sage : C.rust },
+              { l: "Net Position", v: analysisTxns.length > 0 ? `${totalIn - totalOut >= 0 ? "+" : ""}$${(totalIn - totalOut).toLocaleString("en", { minimumFractionDigits: 0 })}` : "—", c: totalIn - totalOut >= 0 ? C.sage : C.rust },
             ] as const).map((m, i) => (
               <div key={i} style={{ background: C.card, padding: "18px 16px" }}>
                 <div style={{ fontSize: "0.55rem", letterSpacing: "0.14em", textTransform: "uppercase", color: C.muted, marginBottom: 5 }}>{m.l}</div>

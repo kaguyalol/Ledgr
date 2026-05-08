@@ -5,6 +5,18 @@ const STORE_TXNS = "transactions";
 
 export type StatementType = "bank" | "credit" | "investment";
 
+export interface InvestmentSummary {
+  periodStart?: string;
+  periodEnd?: string;
+  beginningValue: number;
+  endingValue: number;
+  credits: number;
+  debits: number;
+  securityTransfers: number;
+  netFlow: number;
+  changeInValue: number;
+}
+
 export interface DbStatement {
   id: string;
   name: string;
@@ -14,6 +26,7 @@ export interface DbStatement {
   txnCount: number;
   isPdf: boolean;
   type: StatementType;
+  summary?: InvestmentSummary;
 }
 
 export interface DbTransaction {
@@ -109,6 +122,21 @@ export async function clearAll(): Promise<void> {
     tx.onerror = () => reject(tx.error);
     tx.objectStore(STORE_STMTS).clear();
     tx.objectStore(STORE_TXNS).clear();
+  });
+}
+
+export async function updateStatementBank(id: string, bank: string): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_STMTS, "readwrite");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    const store = tx.objectStore(STORE_STMTS);
+    const getReq = store.get(id);
+    getReq.onsuccess = () => {
+      const s = getReq.result as DbStatement | undefined;
+      if (s) store.put({ ...s, bank });
+    };
   });
 }
 
